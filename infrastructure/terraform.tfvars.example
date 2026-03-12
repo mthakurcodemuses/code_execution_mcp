@@ -1,0 +1,18 @@
+# Copy this file to terraform.tfvars and fill in the values.
+# terraform.tfvars is gitignored to avoid committing secrets.
+
+aws_region   = "us-east-1"
+project_name = "code-execution"
+environment  = "dev"
+
+lambda_memory_mb       = 512
+lambda_timeout_seconds = 35
+max_execution_timeout  = 30
+
+vpc_cidr             = "10.10.0.0/16"
+private_subnet_cidrs = ["10.10.1.0/24", "10.10.2.0/24"]
+
+# ARN of the IAM role or user that runs the MCP server.
+# Leave empty to skip the resource-based policy.
+mcp_caller_arn = ""
+# Example: mcp_caller_arn = "arn:aws:iam::123456789012:role/my-mcp-server-role"
