@@ -1,9 +1,88 @@
 # =============================================================================
-# IAM – Lambda execution role
+# IAM – Least-privilege execution role for the sandbox Lambda
+#
+# Principle-of-least-privilege design
+# ------------------------------------
+# 1. Trust policy  – only the Lambda service may assume the role.
+# 2. Permission Boundary – a hard ceiling on what the role can ever do,
+#    regardless of any future policy attachments.  Even if an operator
+#    accidentally attaches AdministratorAccess, the boundary prevents it
+#    from taking effect.
+# 3. Inline policy – grants ONLY the three action groups the Lambda runtime
+#    actually needs: write logs, manage its own VPC ENI, and write X-Ray
+#    segments.  Every other AWS action is implicitly denied.
+# 4. No AWS-managed policies attached (they are intentionally broader than
+#    needed; we replicate only the exact actions required).
+#
+# MCP caller policy
+# -----------------
+# A standalone policy scoped to a single Lambda ARN is provided for the
+# principal that runs the MCP server (attach it to that role/user).
 # =============================================================================
 
+data "aws_caller_identity" "current" {}
+
 # ---------------------------------------------------------------------------
-# Trust policy: only Lambda service may assume this role
+# Permission Boundary
+# Defines the MAXIMUM permissions the execution role may ever hold.
+# Actions outside this boundary are always denied, even if a broader policy
+# is later attached.
+# ---------------------------------------------------------------------------
+data "aws_iam_policy_document" "lambda_exec_boundary" {
+  # 1. Allow only the exact AWS actions the Lambda runtime needs
+  statement {
+    sid    = "AllowRuntimeActions"
+    effect = "Allow"
+    actions = [
+      # CloudWatch Logs
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+      # VPC ENI management (required for VPC-attached Lambda)
+      "ec2:CreateNetworkInterface",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DeleteNetworkInterface",
+      "ec2:AssignPrivateIpAddresses",
+      "ec2:UnassignPrivateIpAddresses",
+      # X-Ray tracing
+      "xray:PutTraceSegments",
+      "xray:PutTelemetryRecords",
+      "xray:GetSamplingRules",
+      "xray:GetSamplingTargets",
+    ]
+    resources = ["*"]
+  }
+
+  # 2. Explicitly deny everything else – belt-and-braces
+  statement {
+    sid    = "DenyEverythingElse"
+    effect = "Deny"
+    not_actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+      "ec2:CreateNetworkInterface",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DeleteNetworkInterface",
+      "ec2:AssignPrivateIpAddresses",
+      "ec2:UnassignPrivateIpAddresses",
+      "xray:PutTraceSegments",
+      "xray:PutTelemetryRecords",
+      "xray:GetSamplingRules",
+      "xray:GetSamplingTargets",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "lambda_exec_boundary" {
+  name        = "${local.name_prefix}-lambda-exec-boundary"
+  description = "Permission boundary for the sandbox Lambda execution role"
+  policy      = data.aws_iam_policy_document.lambda_exec_boundary.json
+}
+
+# ---------------------------------------------------------------------------
+# Trust policy
 # ---------------------------------------------------------------------------
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
@@ -17,73 +96,90 @@ data "aws_iam_policy_document" "lambda_assume_role" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# Execution role  (boundary applied at creation time)
+# ---------------------------------------------------------------------------
 resource "aws_iam_role" "lambda_exec" {
-  name               = "${local.name_prefix}-lambda-exec"
-  description        = "Execution role for the code-execution sandbox Lambda"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+  name                 = "${local.name_prefix}-lambda-exec"
+  description          = "Execution role for the code-execution sandbox Lambda"
+  assume_role_policy   = data.aws_iam_policy_document.lambda_assume_role.json
+  permissions_boundary = aws_iam_policy.lambda_exec_boundary.arn
 }
 
 # ---------------------------------------------------------------------------
-# Attach AWS-managed policies
+# Inline policy  – grants only what the runtime actually needs
+# (mirrors the boundary Allow statement so effective permissions = boundary)
 # ---------------------------------------------------------------------------
-
-# Allows writing logs to CloudWatch
-resource "aws_iam_role_policy_attachment" "lambda_logs" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-# Allows the Lambda to be placed inside a VPC (create ENIs)
-resource "aws_iam_role_policy_attachment" "lambda_vpc" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
-}
-
-# ---------------------------------------------------------------------------
-# Explicit deny: prevent the Lambda from calling any AWS API
-# (defence-in-depth on top of the VPC network isolation)
-# ---------------------------------------------------------------------------
-data "aws_iam_policy_document" "deny_aws_apis" {
+data "aws_iam_policy_document" "lambda_exec_allow" {
   statement {
-    sid       = "DenyAllAWSAPIs"
-    effect    = "Deny"
-    actions   = ["*"]
-    resources = ["*"]
+    sid    = "WriteLogs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    # Scope to this function's log group only
+    resources = [
+      "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.name_prefix}-sandbox:*",
+    ]
+  }
 
-    # Carve out the two actions that the Lambda runtime itself needs
-    condition {
-      test     = "StringNotEquals"
-      variable = "aws:RequestedRegion"
-      values   = [var.aws_region]
-    }
+  statement {
+    sid    = "ManageVpcEni"
+    effect = "Allow"
+    actions = [
+      "ec2:CreateNetworkInterface",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DeleteNetworkInterface",
+      "ec2:AssignPrivateIpAddresses",
+      "ec2:UnassignPrivateIpAddresses",
+    ]
+    resources = ["*"]   # EC2 ENI actions do not support resource-level conditions
+  }
+
+  statement {
+    sid    = "WriteXRay"
+    effect = "Allow"
+    actions = [
+      "xray:PutTraceSegments",
+      "xray:PutTelemetryRecords",
+      "xray:GetSamplingRules",
+      "xray:GetSamplingTargets",
+    ]
+    resources = ["*"]
   }
 }
 
-resource "aws_iam_policy" "deny_aws_apis" {
-  name        = "${local.name_prefix}-deny-aws-apis"
-  description = "Prevent the sandbox Lambda from making AWS API calls"
-  policy      = data.aws_iam_policy_document.deny_aws_apis.json
+resource "aws_iam_role_policy" "lambda_exec_inline" {
+  name   = "sandbox-runtime-allow"
+  role   = aws_iam_role.lambda_exec.id
+  policy = data.aws_iam_policy_document.lambda_exec_allow.json
 }
 
-resource "aws_iam_role_policy_attachment" "deny_aws_apis" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = aws_iam_policy.deny_aws_apis.arn
-}
-
-# =============================================================================
-# IAM – MCP server caller policy (attach to the role/user running the server)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# MCP server caller policy
+# Attach this to whatever IAM role/user runs the MCP server process.
+# Scoped to a single Lambda ARN – no wildcard.
+# ---------------------------------------------------------------------------
 data "aws_iam_policy_document" "mcp_invoke" {
   statement {
-    sid       = "InvokeSandboxLambda"
-    effect    = "Allow"
-    actions   = ["lambda:InvokeFunction"]
+    sid     = "InvokeSandboxLambdaOnly"
+    effect  = "Allow"
+    actions = ["lambda:InvokeFunction"]
     resources = [aws_lambda_function.sandbox.arn]
+
+    # Optional: restrict to synchronous invocations only
+    condition {
+      test     = "StringEquals"
+      variable = "lambda:InvocationType"
+      values   = ["RequestResponse"]
+    }
   }
 }
 
 resource "aws_iam_policy" "mcp_invoke" {
   name        = "${local.name_prefix}-mcp-invoke"
-  description = "Allows the MCP server to invoke the code-execution sandbox Lambda"
+  description = "Allows the MCP server to invoke the sandbox Lambda (RequestResponse only)"
   policy      = data.aws_iam_policy_document.mcp_invoke.json
 }

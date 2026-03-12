@@ -68,7 +68,13 @@ resource "aws_lambda_function" "sandbox" {
   environment {
     variables = {
       MAX_TIMEOUT_SECONDS = tostring(var.max_execution_timeout)
+      ENVIRONMENT         = var.environment
     }
+  }
+
+  # Active X-Ray tracing
+  tracing_config {
+    mode = "Active"
   }
 
   # Attach to the private (no-internet) subnets
@@ -79,8 +85,7 @@ resource "aws_lambda_function" "sandbox" {
 
   depends_on = [
     aws_cloudwatch_log_group.lambda_logs,
-    aws_iam_role_policy_attachment.lambda_logs,
-    aws_iam_role_policy_attachment.lambda_vpc,
+    aws_iam_role_policy.lambda_exec_inline,
   ]
 }
 
@@ -94,4 +99,11 @@ resource "aws_lambda_permission" "allow_mcp_caller" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.sandbox.function_name
   principal     = var.mcp_caller_arn
+}
+
+# ---------------------------------------------------------------------------
+# X-Ray encryption (uses AWS-managed key; swap to aws_kms_key for CMK)
+# ---------------------------------------------------------------------------
+resource "aws_xray_encryption_config" "sandbox" {
+  type = "NONE"   # change to "KMS" and add key_id for CMK encryption
 }
